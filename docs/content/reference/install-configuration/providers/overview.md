@@ -18,6 +18,27 @@ While each provider is different, you can think of each as belonging to one of f
 - Annotation-based: a separate object, with annotations, defines the characteristics of the container
 - File-based: uses files to define configuration
 
+## KV Provider Failure Behavior
+
+Key-value providers do not depend on the order in which the store returns keys or array indexes.
+The same routing configuration produces the same result regardless of the store node serving the request.
+
+When a key-value store becomes unavailable, Traefik keeps the last valid routing configuration and keeps serving it
+while retrying the store connection with exponential backoff. The backoff starts at 500ms, is capped at 30s,
+and includes jitter to avoid synchronized retries across replicas.
+
+If no valid configuration has ever been loaded, Traefik does not publish an empty or partial configuration.
+Requests that depend on those rules are rejected instead of being forwarded without the configured middleware.
+
+Store failures and recoveries are logged with stable `event` fields:
+
+- `kv_connection_unavailable` when the initial store connection cannot be established.
+- `kv_configuration_unavailable` when the routing configuration cannot be read or decoded.
+- `kv_configuration_recovered` when a valid configuration is read again.
+
+The retry schedule, consecutive failure count, and whether the last valid configuration is still in use are included
+in those log entries so they can be used directly for alerting.
+
 ## Provider Namespace
 
 When you declare certain objects in the Traefik dynamic configuration,

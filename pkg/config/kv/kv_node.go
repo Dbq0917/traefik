@@ -1,9 +1,10 @@
 package kv
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/kvtools/valkeyrie/store"
@@ -77,9 +78,8 @@ func containsNode(nodes []*parser.Node, name string) *parser.Node {
 func filterPairs(pairs []*store.KVPair, filters []string) []*store.KVPair {
 	exp := regexp.MustCompile(`^(.+)/\d+$`)
 
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].Key < pairs[j].Key
-	})
+	pairs = slices.Clone(pairs)
+	sortKVPairs(pairs)
 
 	simplePairs := map[string]*store.KVPair{}
 	slicePairs := map[string][]string{}
@@ -120,9 +120,85 @@ func filterPairs(pairs []*store.KVPair, filters []string) []*store.KVPair {
 		sortedPairs = append(sortedPairs, v)
 	}
 
-	sort.Slice(sortedPairs, func(i, j int) bool {
-		return sortedPairs[i].Key < sortedPairs[j].Key
-	})
+	sortKVPairs(sortedPairs)
 
 	return sortedPairs
+}
+
+func sortKVPairs(pairs []*store.KVPair) {
+	slices.SortFunc(pairs, func(left, right *store.KVPair) int {
+		return compareKVKey(left.Key, right.Key)
+	})
+}
+
+func compareKVKey(left, right string) int {
+	commonPrefix := 0
+	for commonPrefix < min(len(left), len(right)) && left[commonPrefix] == right[commonPrefix] {
+		commonPrefix++
+	}
+
+	if commonPrefix == min(len(left), len(right)) {
+		return cmp.Compare(len(left), len(right))
+	}
+
+	if isDecimalDigit(left[commonPrefix]) && isDecimalDigit(right[commonPrefix]) {
+		segmentStart := strings.LastIndexByte(left[:commonPrefix], '/') + 1
+		leftSegment := segmentAt(left, segmentStart)
+		rightSegment := segmentAt(right, segmentStart)
+
+		if isDecimal(leftSegment) && isDecimal(rightSegment) {
+			// Indexes are part of the configuration structure, so compare them numerically before falling back to their
+			// textual representation to keep the result deterministic for duplicate indexes such as 1 and 01.
+			if result := compareDecimal(leftSegment, rightSegment); result != 0 {
+				return result
+			}
+		}
+	}
+
+	return cmp.Compare(left, right)
+}
+
+func segmentAt(key string, start int) string {
+	index := strings.IndexByte(key[start:], '/')
+	if index < 0 {
+		return key[start:]
+	}
+
+	return key[start : start+index]
+}
+
+func compareDecimal(left, right string) int {
+	left = strings.TrimLeft(left, "0")
+	right = strings.TrimLeft(right, "0")
+
+	if left == "" {
+		left = "0"
+	}
+	if right == "" {
+		right = "0"
+	}
+
+	if result := cmp.Compare(len(left), len(right)); result != 0 {
+		return result
+	}
+
+	return cmp.Compare(left, right)
+}
+
+func isDecimal(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for i := range len(value) {
+		if !isDecimalDigit(value[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isDecimalDigit(value byte) bool {
+	return value >= '0' && value <= '9'
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/kvtools/valkeyrie/store"
 )
@@ -26,6 +28,10 @@ type Mock struct {
 	Error           KvError
 	KVPairs         []*store.KVPair
 	WatchTreeMethod func() <-chan []*store.KVPair
+	ListFunc        func(context.Context, string) ([]*store.KVPair, error)
+	ListCalls       atomic.Int64
+
+	mu sync.RWMutex
 }
 
 func newKvClientMock(kvPairs []*store.KVPair, err error) *Mock {
@@ -92,16 +98,43 @@ func (s *Mock) NewLock(ctx context.Context, key string, options *store.LockOptio
 
 // List mock.
 func (s *Mock) List(ctx context.Context, prefix string, options *store.ReadOptions) ([]*store.KVPair, error) {
-	if err := s.Error.List; err != nil {
-		return nil, err
+	s.ListCalls.Add(1)
+
+	s.mu.RLock()
+	listFunc := s.ListFunc
+	listErr := s.Error.List
+	kvPairs := s.KVPairs
+	s.mu.RUnlock()
+
+	if listFunc != nil {
+		return listFunc(ctx, prefix)
 	}
+
+	if listErr != nil {
+		return nil, listErr
+	}
+
 	var kv []*store.KVPair
-	for _, kvPair := range s.KVPairs {
+	for _, kvPair := range kvPairs {
 		if strings.HasPrefix(kvPair.Key, prefix) {
 			kv = append(kv, kvPair)
 		}
 	}
 	return kv, nil
+}
+
+func (s *Mock) SetListError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.Error.List = err
+}
+
+func (s *Mock) SetListFunc(listFunc func(context.Context, string) ([]*store.KVPair, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ListFunc = listFunc
 }
 
 // DeleteTree mock.

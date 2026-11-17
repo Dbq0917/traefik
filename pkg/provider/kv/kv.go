@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -24,8 +25,10 @@ type Provider struct {
 
 	Endpoints []string `description:"KV store endpoints." json:"endpoints,omitempty" toml:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 
-	name     string
-	kvClient store.Store
+	name           string
+	kvClient       store.Store
+	lastGoodMu     sync.RWMutex
+	lastGoodConfig *dynamic.Configuration
 }
 
 // SetDefaults sets the default values.
@@ -62,17 +65,24 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 	}
 
 	notify := func(err error, time time.Duration) {
-		logger.Error().Err(err).Msgf("KV connection error, retrying in %s", time)
+		logger.Error().
+			Str("event", "kv_connection_unavailable").
+			Dur("retryIn", time).
+			Err(err).
+			Msg("KV connection error, retrying")
 	}
 
-	err := backoff.RetryNotify(safe.OperationWithRecover(operation), backoff.WithContext(job.NewBackOff(backoff.NewExponentialBackOff()), ctx), notify)
+	err := backoff.RetryNotify(safe.OperationWithRecover(operation), backoff.WithContext(newRetryBackOff(), ctx), notify)
 	if err != nil {
 		return fmt.Errorf("cannot connect to KV server: %w", err)
 	}
 
 	configuration, err := p.buildConfiguration(ctx)
 	if err != nil {
-		logger.Error().Err(err).Msg("Cannot build the configuration")
+		logger.Error().
+			Str("event", "kv_configuration_unavailable").
+			Err(err).
+			Msg("Cannot build the configuration")
 	} else {
 		configurationChan <- dynamic.Message{
 			ProviderName:  p.name,
@@ -93,11 +103,49 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 }
 
 func (p *Provider) watchKv(ctx context.Context, configurationChan chan<- dynamic.Message) error {
+	var (
+		consecutiveFailures int
+		fallbackPublished   bool
+		degraded            bool
+	)
+
+	publish := func(configuration *dynamic.Configuration) {
+		if configuration == nil {
+			return
+		}
+
+		select {
+		case configurationChan <- dynamic.Message{
+			ProviderName:  p.name,
+			Configuration: configuration,
+		}:
+		case <-ctx.Done():
+			return
+		}
+
+		if degraded {
+			log.Ctx(ctx).Info().
+				Str("event", "kv_configuration_recovered").
+				Int("consecutiveFailures", consecutiveFailures).
+				Msg("KV configuration source recovered")
+		}
+		consecutiveFailures = 0
+		fallbackPublished = false
+		degraded = false
+	}
+
 	operation := func() error {
 		events, err := p.kvClient.WatchTree(ctx, p.RootKey, nil)
 		if err != nil {
 			return fmt.Errorf("failed to watch KV: %w", err)
 		}
+
+		configuration, err := p.buildConfiguration(ctx)
+		if err != nil {
+			fallbackPublished = p.publishLastGoodConfiguration(ctx, configurationChan, fallbackPublished)
+			return err
+		}
+		publish(configuration)
 
 		for {
 			select {
@@ -110,25 +158,35 @@ func (p *Provider) watchKv(ctx context.Context, configurationChan chan<- dynamic
 
 				configuration, errC := p.buildConfiguration(ctx)
 				if errC != nil {
+					fallbackPublished = p.publishLastGoodConfiguration(ctx, configurationChan, fallbackPublished)
 					return errC
 				}
 
-				if configuration != nil {
-					configurationChan <- dynamic.Message{
-						ProviderName:  p.name,
-						Configuration: configuration,
-					}
-				}
+				publish(configuration)
 			}
 		}
 	}
 
 	notify := func(err error, time time.Duration) {
-		log.Ctx(ctx).Error().Err(err).Msgf("Provider error, retrying in %s", time)
+		consecutiveFailures++
+		degraded = true
+
+		if !fallbackPublished {
+			fallbackPublished = p.publishLastGoodConfiguration(ctx, configurationChan, false)
+		}
+
+		log.Ctx(ctx).Error().
+			Str("event", "kv_configuration_unavailable").
+			Int("consecutiveFailures", consecutiveFailures).
+			Dur("retryIn", time).
+			Bool("usingLastKnownGood", p.hasLastKnownGood()).
+			Bool("fallbackPublished", fallbackPublished).
+			Err(err).
+			Msg("KV configuration source unavailable, retrying")
 	}
 
 	return backoff.RetryNotify(safe.OperationWithRecover(operation),
-		backoff.WithContext(job.NewBackOff(backoff.NewExponentialBackOff()), ctx), notify)
+		backoff.WithContext(newRetryBackOff(), ctx), notify)
 }
 
 func (p *Provider) buildConfiguration(ctx context.Context) (*dynamic.Configuration, error) {
@@ -137,11 +195,14 @@ func (p *Provider) buildConfiguration(ctx context.Context) (*dynamic.Configurati
 		if errors.Is(err, store.ErrKeyNotFound) {
 			// This empty configuration satisfies the pkg/server/configurationwatcher.go isEmptyConfiguration func constraints,
 			// and will not be discarded by the configuration watcher.
-			return &dynamic.Configuration{
+			cfg := &dynamic.Configuration{
 				HTTP: &dynamic.HTTPConfiguration{
 					Routers: make(map[string]*dynamic.Router),
 				},
-			}, nil
+			}
+			p.setLastGoodConfiguration(cfg)
+
+			return cfg, nil
 		}
 
 		return nil, err
@@ -153,7 +214,59 @@ func (p *Provider) buildConfiguration(ctx context.Context) (*dynamic.Configurati
 		return nil, err
 	}
 
+	p.setLastGoodConfiguration(cfg)
+
 	return cfg, nil
+}
+
+func (p *Provider) setLastGoodConfiguration(cfg *dynamic.Configuration) {
+	p.lastGoodMu.Lock()
+	defer p.lastGoodMu.Unlock()
+
+	p.lastGoodConfig = cfg.DeepCopy()
+}
+
+func (p *Provider) publishLastGoodConfiguration(ctx context.Context, configurationChan chan<- dynamic.Message, alreadyPublished bool) bool {
+	if alreadyPublished || configurationChan == nil {
+		return alreadyPublished
+	}
+
+	p.lastGoodMu.RLock()
+	cfg := p.lastGoodConfig
+	p.lastGoodMu.RUnlock()
+	if cfg == nil {
+		return false
+	}
+
+	select {
+	case configurationChan <- dynamic.Message{
+		ProviderName:  p.name,
+		Configuration: cfg.DeepCopy(),
+	}:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		return false
+	}
+}
+
+func (p *Provider) hasLastKnownGood() bool {
+	p.lastGoodMu.RLock()
+	defer p.lastGoodMu.RUnlock()
+
+	return p.lastGoodConfig != nil
+}
+
+func newRetryBackOff() *job.BackOff {
+	exponential := backoff.NewExponentialBackOff()
+	exponential.InitialInterval = 500 * time.Millisecond
+	exponential.RandomizationFactor = 0.5
+	exponential.Multiplier = 2
+	// The 50% jitter keeps the effective retry interval below the 30s ceiling.
+	exponential.MaxInterval = 20 * time.Second
+
+	return job.NewBackOff(exponential)
 }
 
 func (p *Provider) createKVClient(ctx context.Context, storeType string, config valkeyrie.Config) (store.Store, error) {

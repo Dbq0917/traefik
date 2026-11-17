@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -977,6 +978,9 @@ func Test_buildConfiguration_KV_error(t *testing.T) {
 }
 
 func TestKvWatchTree(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
 	returnedChans := make(chan chan []*store.KVPair)
 	provider := Provider{
 		kvClient: &Mock{
@@ -990,12 +994,13 @@ func TestKvWatchTree(t *testing.T) {
 
 	configChan := make(chan dynamic.Message)
 	go func() {
-		err := provider.watchKv(t.Context(), configChan)
+		err := provider.watchKv(ctx, configChan)
 		require.NoError(t, err)
 	}()
 
 	select {
 	case c1 := <-returnedChans:
+		<-configChan
 		c1 <- []*store.KVPair{}
 		<-configChan
 		close(c1) // WatchTree chans can close due to error
@@ -1005,6 +1010,7 @@ func TestKvWatchTree(t *testing.T) {
 
 	select {
 	case c2 := <-returnedChans:
+		<-configChan
 		c2 <- []*store.KVPair{}
 		<-configChan
 	case <-time.After(1 * time.Second):
